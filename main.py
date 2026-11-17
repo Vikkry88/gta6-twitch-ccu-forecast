@@ -1,6 +1,6 @@
 """Forecast GTA VI's launch-day Twitch viewers hour by hour.
 
-Method (calibrated only from the comparables shipped inside each case file):
+Method (v3; calibrated only from the comparables shipped inside each case file):
 
 A launch day's shape is not a flat line. Hour 1 (00:00-01:00 UTC) only
 catches the earliest rolling-midnight unlocks, so the category usually
@@ -10,22 +10,34 @@ on how big hour 1 already was: across the 37 usable comparables,
 corr(log hour-1, log peak ratio) is about -0.94, i.e. a game whose
 hour 1 is already huge barely grows, while one whose hour 1 is tiny
 can grow a hundredfold. So the forecast is conditioned on hour 1's
-print, in two complementary ways, blended 50/50 in log space:
+print, as the average (in log space) of two members that estimate the
+same conditional quantiles two robust ways:
 
-1. Quadratic log-log regression, per hour: log(viewers_h) is regressed
-   on log(p1) and log(p1)^2 over the comparables (centred for
-   conditioning), and the spread at each hour is the empirical
-   distribution of that hour's regression residuals, read off at the
-   requested quantile levels. The median curve is smoothed with a
-   3-point moving average so it is not jagged from sparse data.
-2. k-nearest-neighbour ratio curve: the 8 comparables whose log hour-1
-   is closest to the case's take part; per hour the 5th/25th/50th/75th/
-   95th percentiles of their log ratios ln(viewers_h / viewers_1) give
-   the quantiles, each curve smoothed the same way. The blended
-   quantiles are then widened by 1.1x in log space around the median:
-   leave-one-out over the comparables showed the un-widened 90% band
-   covering only 0.866 of hours, and 1.1x brings that to 0.894 at no
-   cost to the loss.
+A. Quantile regression, per hour and level: each of the five quantiles
+   of log(viewers_h) is fitted directly by a quadratic in log(p1)
+   (centred), minimising that level's pinball loss by iteratively
+   reweighted least squares. Fitting quantiles directly, instead of a
+   mean plus residual quantiles, fits the heavy right tail of launch
+   growth without letting the few hundred-fold growers drag the fit.
+   Blended 70/30 with the k-nearest-neighbour ratio curve below (k=12).
+B. Least-absolute-deviation regression, per hour: the conditional
+   median of log(viewers_h) is fitted by a quadratic in log(p1) that
+   minimises absolute error, so the few hundred-fold growers cannot
+   pull it; the spread at each hour is the empirical distribution of
+   that hour's residuals, read off at the requested quantile levels.
+   Blended 70/30 with the k-nearest-neighbour ratio curve below (k=8).
+
+The k-nearest-neighbour ratio curve: the comparables whose log hour-1
+is closest to the case's take part; per hour the 5th/25th/50th/75th/
+95th percentiles of their log ratios ln(viewers_h / viewers_1) give
+the quantiles, each curve smoothed the same way. Each member's
+quantiles are widened by 1.1x in log space around its median, and the
+two members are averaged in log space: leave-one-out over the
+comparables gives v3 a loss of 0.369 (0.251 on launches with a large
+hour-1 print, 0.259 practice-weighted) against v2's 0.375 (0.260,
+0.266); v2's practice loss was 0.222. The median curve of each member
+is smoothed with a 3-point moving average so it is not jagged from
+sparse data.
 
 If a component cannot be built for an hour (too few comparables with
 that hour's print, or no hour-1 print at all) it falls back, per hour,
@@ -166,6 +178,54 @@ def fit_quadratic(xs, ys):
     return solve_linear(a, t)
 
 
+def qreg_fit(xs, ys, tau, deg=2, iters=30):
+    """Quantile regression: y ~ poly(x) fitted to minimise tau's pinball loss.
+
+    Iteratively reweighted least squares: a point above the fit gets
+    weight tau / |residual|, one below it (1 - tau) / |residual|, so the
+    fit is pulled to the tau-th conditional quantile instead of the
+    mean. With tau = 0.5 this is least-absolute-deviation (median)
+    regression. Starts from the least-squares fit, so it always
+    returns something sane when the data can support a fit at all.
+    Deterministic: fixed iteration count, no randomness.
+    """
+    beta = fit_quadratic(xs, ys) if deg == 2 else None
+    if beta is None:
+        return None
+    for _ in range(iters):
+        s = [0.0] * (2 * deg + 1)
+        t = [0.0] * (deg + 1)
+        for x, y in zip(xs, ys):
+            u = x - LOG_P1_CENTRE
+            r = y - sum(beta[i] * u ** i for i in range(deg + 1))
+            if abs(r) < 1e-6:
+                w = 1e6
+            else:
+                w = (tau if r > 0 else (1.0 - tau)) / abs(r)
+            w = min(w, 1e4)
+            p = 1.0
+            for k in range(2 * deg + 1):
+                s[k] += w * p
+                if k <= deg:
+                    t[k] += w * p * y
+                p *= u
+        a = [[s[i + j] for j in range(deg + 1)] for i in range(deg + 1)]
+        new_beta = solve_linear(a, t)
+        if new_beta is None:
+            break
+        if max(abs(a - b) for a, b in zip(new_beta, beta)) < 1e-9:
+            beta = new_beta
+            break
+        beta = new_beta
+    return beta
+
+
+def qreg_predict(beta, x, deg=2):
+    """Evaluate a fitted quantile-regression polynomial at log hour-1 x."""
+    u = x - LOG_P1_CENTRE
+    return sum(beta[i] * u ** i for i in range(deg + 1))
+
+
 def smooth(curve):
     """3-point moving average over hours 2..24 (edges use what exists)."""
     out = {}
@@ -208,12 +268,55 @@ def comparable_curves(case):
     return {name: curves[name] for name in sorted(curves)}
 
 
-def regression_component(curves, p1, levels):
-    """Per-hour quadratic log-log regression on log hour-1.
+def quantile_regression_component(curves, p1, levels):
+    """Per-hour, per-level quantile regression on log hour-1.
 
-    Returns {hour: [log quantiles at `levels`]} for the hours where
-    the fit could be made, plus the set of hours it covers. The
-    spread is the empirical residual distribution at that hour.
+    Each of the five quantiles of log(viewers_h) is fitted directly by
+    a quadratic in log(p1), minimising that level's own pinball loss.
+    Returns {hour: [log quantiles at `levels`]}. The median curve is
+    smoothed with a 3-point moving average and every level is shifted
+    by the same amount, so the shape stays coherent.
+    """
+    log_p1 = math.log(p1)
+    rows = {}
+    for h in range(2, 25):
+        xs = []
+        ys = []
+        for by_hour in curves.values():
+            if h in by_hour:
+                xs.append(math.log(by_hour[1]))
+                ys.append(math.log(by_hour[h]))
+        if len(xs) < REG_MIN_POINTS:
+            continue
+        row = []
+        for tau in levels:
+            beta = qreg_fit(xs, ys, tau)
+            if beta is None:
+                row = None
+                break
+            row.append(qreg_predict(beta, log_p1))
+        if row is None:
+            continue
+        rows[h] = row
+    if not rows:
+        return {}
+    med = smooth({h: row[len(row) // 2] for h, row in rows.items()})
+    out = {}
+    for h, row in rows.items():
+        shift = med[h] - row[len(row) // 2]
+        out[h] = [v + shift for v in row]
+    return out
+
+
+def lad_regression_component(curves, p1, levels):
+    """Per-hour LAD (median) regression on log hour-1, plus residual spread.
+
+    The conditional median of log(viewers_h) is fitted by a quadratic
+    in log(p1) that minimises absolute error, so the few launches whose
+    hour 1 was tiny and then grew a hundredfold cannot drag it. The
+    spread at each hour is the empirical distribution of that hour's
+    residuals around the LAD fit, read off at the requested levels.
+    Returns {hour: [log quantiles at `levels`]}.
     """
     log_p1 = math.log(p1)
     med = {}
@@ -227,27 +330,22 @@ def regression_component(curves, p1, levels):
                 ys.append(math.log(by_hour[h]))
         if len(xs) < REG_MIN_POINTS:
             continue
-        beta = fit_quadratic(xs, ys)
+        beta = qreg_fit(xs, ys, 0.5)
         if beta is None:
             continue
-        u = log_p1 - LOG_P1_CENTRE
-        med[h] = beta[0] + beta[1] * u + beta[2] * u * u
-        resid[h] = sorted(
-            y - (beta[0] + beta[1] * (x - LOG_P1_CENTRE)
-                 + beta[2] * (x - LOG_P1_CENTRE) ** 2)
-            for x, y in zip(xs, ys)
-        )
+        med[h] = qreg_predict(beta, log_p1)
+        resid[h] = sorted(y - qreg_predict(beta, x) for x, y in zip(xs, ys))
     if not med:
-        return {}, set()
+        return {}
     med = smooth(med)
     out = {}
     for h, mu in med.items():
         out[h] = [mu + (pct(resid[h], tau) or 0.0) for tau in levels]
-    return out, set(out)
+    return out
 
 
-def knn_component(curves, p1, levels):
-    """Per-hour ratio quantiles of the K nearest comparables by log p1.
+def knn_component(curves, p1, levels, k=K_NEIGHBOURS):
+    """Per-hour ratio quantiles of the k nearest comparables by log p1.
 
     Returns {hour: [log quantiles at `levels`]}. Falls back to all
     comparables for an hour with fewer than 3 neighbours reporting.
@@ -257,7 +355,7 @@ def knn_component(curves, p1, levels):
         curves.items(),
         key=lambda kv: (abs(math.log(kv[1][1]) - log_p1), kv[0]),
     )
-    near = [by_hour for _, by_hour in ranked[:K_NEIGHBOURS]]
+    near = [by_hour for _, by_hour in ranked[:k]]
     all_curves = list(curves.values())
     quantiles = {tau: {} for tau in levels}
     for h in range(2, 25):
@@ -305,8 +403,40 @@ def widen_spread(log_q, factor):
     return [med + (v - med) * factor for v in log_q]
 
 
+def member_forecast(curves, p1, levels, reg_kind, k, blend_reg):
+    """One ensemble member: regression component blended with kNN.
+
+    `reg_kind` is "qreg" (quantile regression per level) or "lad"
+    (LAD median + residual quantiles). Returns {hour: [log quantiles]}
+    in log space, before the 1.1x log-spread widening: widening is
+    linear in log space around the median, so widening the averaged
+    members once gives the same result as widening each member first.
+    """
+    if reg_kind == "qreg":
+        reg = quantile_regression_component(curves, p1, levels)
+    else:
+        reg = lad_regression_component(curves, p1, levels)
+    knn = knn_component(curves, p1, levels, k)
+    out = {}
+    for h in range(2, 25):
+        if h in reg and h in knn:
+            out[h] = [blend_reg * a + (1.0 - blend_reg) * b
+                      for a, b in zip(reg[h], knn[h])]
+        elif h in reg:
+            out[h] = list(reg[h])
+        elif h in knn:
+            out[h] = list(knn[h])
+    return out
+
+
 def forecast_case(case):
-    """One case's forecast: {"hours": [{"hour": h, "q": [...]}, ...]}."""
+    """One case's forecast: {"hours": [{"hour": h, "q": [...]}, ...]}.
+
+    The forecast is the average (in log space) of the two members:
+    quantile regression blended 70/30 with kNN (k=12), and LAD
+    regression blended 70/30 with kNN (k=8). Hours neither member
+    covers fall back to the persistence quantiles.
+    """
     levels = list(case.get("levels") or LEVELS)
     first = next((k for k in case.get("known") or [] if k.get("hour") == 1), None)
     if first is None:
@@ -317,20 +447,17 @@ def forecast_case(case):
     p1 = float(p1)
 
     curves = comparable_curves(case)
-    reg, _ = regression_component(curves, p1, levels)
-    knn = knn_component(curves, p1, levels)
+    member_a = member_forecast(curves, p1, levels, "qreg", 12, 0.7)
+    member_b = member_forecast(curves, p1, levels, "lad", 8, 0.7)
 
     rows = []
     for row in case.get("forecast") or []:
         h = row.get("hour")
         if not isinstance(h, int) or not 2 <= h <= 24:
             continue
-        if h in reg and h in knn:
-            log_q = [0.5 * a + 0.5 * b for a, b in zip(reg[h], knn[h])]
-        elif h in reg:
-            log_q = list(reg[h])
-        elif h in knn:
-            log_q = list(knn[h])
+        rows_h = [m[h] for m in (member_a, member_b) if h in m]
+        if rows_h:
+            log_q = [sum(col) / len(col) for col in zip(*rows_h)]
         else:
             log_q = persistence_quantiles(p1, h, levels)
             if log_q is None:
