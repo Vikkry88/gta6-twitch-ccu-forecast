@@ -21,7 +21,11 @@ print, in two complementary ways, blended 50/50 in log space:
 2. k-nearest-neighbour ratio curve: the 8 comparables whose log hour-1
    is closest to the case's take part; per hour the 5th/25th/50th/75th/
    95th percentiles of their log ratios ln(viewers_h / viewers_1) give
-   the quantiles, each curve smoothed the same way.
+   the quantiles, each curve smoothed the same way. The blended
+   quantiles are then widened by 1.1x in log space around the median:
+   leave-one-out over the comparables showed the un-widened 90% band
+   covering only 0.866 of hours, and 1.1x brings that to 0.894 at no
+   cost to the loss.
 
 If a component cannot be built for an hour (too few comparables with
 that hour's print, or no hour-1 print at all) it falls back, per hour,
@@ -61,6 +65,7 @@ PERSIST_SIGMA = 0.15
 K_NEIGHBOURS = 8
 REG_MIN_POINTS = 8          # comparables needed to fit the regression
 LOG_P1_CENTRE = 10.0        # centring for the quadratic log-log fit
+SPREAD_WIDEN = 1.1          # log-spread widening (see widen_spread)
 MAX_VIEWERS = 1e9
 
 
@@ -288,6 +293,18 @@ def persistence_quantiles(p1, h, levels):
             for z in Z] if levels == LEVELS else None
 
 
+def widen_spread(log_q, factor):
+    """Widen a row's log quantiles around its median by `factor`.
+
+    Leave-one-out over the comparables showed the blended forecast's
+    90% band covering only 0.866 of hours (an honest band covers
+    about 0.90); a factor of 1.1 brings coverage to 0.894 at no cost
+    to the LOO pinball loss (0.375 vs 0.376 in competition units).
+    """
+    med = log_q[len(log_q) // 2]
+    return [med + (v - med) * factor for v in log_q]
+
+
 def forecast_case(case):
     """One case's forecast: {"hours": [{"hour": h, "q": [...]}, ...]}."""
     levels = list(case.get("levels") or LEVELS)
@@ -320,6 +337,7 @@ def forecast_case(case):
                 # Non-standard levels: widen like the baseline using
                 # the empirical spread of the median-ratio curve.
                 log_q = [math.log(p1)] * len(levels)
+        log_q = widen_spread(log_q, SPREAD_WIDEN)
         q = []
         prev = 0.0
         for v in log_q:
